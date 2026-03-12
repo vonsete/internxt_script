@@ -11,12 +11,13 @@ Uso:
     python internxt.py mv /origen/archivo.txt /destino/
     python internxt.py rm /ruta/archivo.txt
     python internxt.py info
-    python internxt.py upload /fichero/local /ruta/internxt/
-    python internxt.py download /ruta/internxt/archivo.txt ./local/
+    python internxt.py upload /fichero-o-carpeta/local /ruta/internxt/
+    python internxt.py download /ruta/internxt/fichero-o-carpeta ./local/
 """
 
 import argparse
 import binascii
+import datetime
 import getpass
 import hashlib
 import json
@@ -419,6 +420,260 @@ def _list_folder(client: InternxtClient, uuid: str) -> tuple[list, list]:
     return folders, files
 
 
+def _ensure_remote_folder(client: InternxtClient, parent_uuid: str, name: str) -> tuple[str, bool]:
+    """
+    Busca la subcarpeta `name` dentro de `parent_uuid`.
+    Si no existe, la crea. Devuelve (uuid, already_existed).
+    """
+    offset = 0
+    while True:
+        data  = client.get(f"/folders/content/{parent_uuid}/folders",
+                           params={"limit": 50, "offset": offset})
+        items = data if isinstance(data, list) else data.get("folders", [])
+        for f in items:
+            if f.get("plainName") == name or f.get("name") == name:
+                return f.get("uuid") or f.get("id"), True
+        if not items or len(items) < 50:
+            break
+        offset += 50
+
+    parent_meta = client.get(f"/folders/{parent_uuid}/meta")
+    parent_id   = parent_meta.get("id")
+    result = client.post("/folders", json={
+        "name":             name,
+        "plainName":        name,
+        "parentId":         parent_id,
+        "parentFolderUuid": parent_uuid,
+    })
+    return result.get("uuid") or result.get("id"), False
+
+
+def _upload_single_file(
+    client: InternxtClient,
+    local_path: Path,
+    folder_uuid: str,
+    mnemonic: str,
+    bucket_id: str,
+    bridge_user: str,
+    user_id: str,
+    prefix: str = "",
+) -> None:
+    """Cifra y sube un único fichero. prefix es para indentación en output recursivo."""
+    file_size = local_path.stat().st_size
+    file_name = local_path.name
+    file_ext  = local_path.suffix.lstrip(".")
+
+    print(f"{prefix}↑  {file_name}  ({_human_size(file_size)})")
+
+    # 1. Cifrar
+    index_bytes = os.urandom(32)
+    iv          = index_bytes[:16]
+    file_key    = _derive_file_key(mnemonic, bucket_id, index_bytes)
+    raw_data    = local_path.read_bytes()
+    encrypted   = _aes256ctr_encrypt(raw_data, file_key, iv)
+    file_hash   = _content_hash(encrypted)
+    index_hex   = index_bytes.hex()
+
+    # 2. Iniciar subida en el Network API
+    net_headers = _network_headers(bridge_user, user_id)
+    r = requests.post(
+        f"{NETWORK_API}/v2/buckets/{bucket_id}/files/start?multiparts=1",
+        json={"uploads": [{"index": 0, "size": file_size}]},
+        headers=net_headers,
+    )
+    if not r.ok:
+        _die(f"Error al iniciar subida: {r.status_code} {r.text}")
+    upload_info = r.json()["uploads"][0]
+    upload_url  = upload_info["url"]
+    shard_uuid  = upload_info["uuid"]
+
+    # 3. Subir contenido cifrado
+    put_r = requests.put(
+        upload_url,
+        data=encrypted,
+        headers={"Content-Type": "application/octet-stream",
+                 "Content-Length": str(len(encrypted))},
+    )
+    if not put_r.ok:
+        _die(f"Error al subir datos: {put_r.status_code} {put_r.text}")
+
+    # 4. Finalizar subida → obtiene fileId
+    r2 = requests.post(
+        f"{NETWORK_API}/v2/buckets/{bucket_id}/files/finish",
+        json={"index": index_hex, "shards": [{"hash": file_hash, "uuid": shard_uuid}]},
+        headers=net_headers,
+    )
+    if not r2.ok:
+        _die(f"Error al finalizar subida: {r2.status_code} {r2.text}")
+    file_id = r2.json().get("id") or r2.json().get("fileId")
+
+    # 5. Registrar en Drive API (o reemplazar si ya existe → crea versión)
+    now      = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+    existing = _find_file_in_folder(client, folder_uuid, file_name)
+    if existing:
+        existing_uuid = existing.get("uuid") or existing.get("id")
+        client.put(f"/files/{existing_uuid}", json={
+            "fileId":           file_id,
+            "size":             file_size,
+            "modificationTime": now,
+        })
+        print(f"{prefix}✓  Actualizado (versión creada): {file_name}")
+    else:
+        result = client.post("/files", json={
+            "name":             file_name,
+            "plainName":        file_name,
+            "bucket":           bucket_id,
+            "fileId":           file_id,
+            "encryptVersion":   "Aes03",
+            "folderUuid":       folder_uuid,
+            "size":             file_size,
+            "type":             file_ext or "",
+            "modificationTime": now,
+            "date":             now,
+        })
+        print(f"{prefix}✓  Subido: {file_name}  (id: {result.get('uuid') or file_id})")
+
+
+def _upload_dir(
+    client: InternxtClient,
+    local_dir: Path,
+    parent_uuid: str,
+    dir_name: str,
+    mnemonic: str,
+    bucket_id: str,
+    bridge_user: str,
+    user_id: str,
+    prefix: str = "",
+) -> None:
+    """Sube recursivamente un directorio local a Internxt."""
+    folder_uuid, existed = _ensure_remote_folder(client, parent_uuid, dir_name)
+    if existed:
+        try:
+            resp = input(f"{prefix}La carpeta '{dir_name}' ya existe en remoto. ¿Fusionar? [s/N] ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp not in ("s", "si", "sí", "y", "yes"):
+            print(f"{prefix}↩  Omitido: {dir_name}/")
+            return
+
+    print(f"{prefix}📁 {dir_name}/")
+
+    for entry in sorted(os.scandir(local_dir), key=lambda e: e.name):
+        if entry.is_file(follow_symlinks=False):
+            _upload_single_file(
+                client, Path(entry.path), folder_uuid,
+                mnemonic, bucket_id, bridge_user, user_id,
+                prefix=prefix + "   ",
+            )
+        elif entry.is_dir(follow_symlinks=False):
+            _upload_dir(
+                client, Path(entry.path), folder_uuid, entry.name,
+                mnemonic, bucket_id, bridge_user, user_id,
+                prefix=prefix + "   ",
+            )
+
+
+def _download_single_file(
+    client: InternxtClient,
+    file_meta: dict,
+    dest_path: Path,
+    mnemonic: str,
+    bucket_id: str,
+    bridge_user: str,
+    user_id: str,
+    prefix: str = "",
+) -> bool:
+    """
+    Descarga y descifra un fichero en dest_path.
+    Pregunta si sobreescribir si ya existe. Devuelve True si se descargó.
+    """
+    fname   = dest_path.name
+    file_id = file_meta.get("fileId") or file_meta.get("file_id")
+    size    = int(file_meta.get("size") or 0)
+    fbucket = file_meta.get("bucket") or bucket_id
+
+    if dest_path.exists():
+        try:
+            resp = input(f"{prefix}'{fname}' ya existe localmente. ¿Sobreescribir? [s/N] ").strip().lower()
+        except EOFError:
+            resp = ""
+        if resp not in ("s", "si", "sí", "y", "yes"):
+            print(f"{prefix}↩  Omitido: {fname}")
+            return False
+
+    print(f"{prefix}↓  {fname}  ({_human_size(size)})")
+
+    net_headers = _network_headers(bridge_user, user_id)
+    r = requests.get(
+        f"{NETWORK_API}/buckets/{fbucket}/files/{file_id}/info",
+        headers={**net_headers, "x-api-version": "2"},
+    )
+    if not r.ok:
+        _die(f"Error al obtener info de descarga: {r.status_code} {r.text}")
+    info      = r.json()
+    index_hex = info.get("index")
+    shards    = info.get("shards", [])
+
+    if not index_hex or not shards:
+        _die(f"Respuesta inesperada del network: {info}")
+
+    index_bytes = bytes.fromhex(index_hex)
+    iv          = index_bytes[:16]
+    file_key    = _derive_file_key(mnemonic, fbucket, index_bytes)
+
+    shards_sorted    = sorted(shards, key=lambda s: s.get("index", 0))
+    encrypted_chunks = []
+    for shard in shards_sorted:
+        shard_url = shard.get("url") or shard.get("farmer", {}).get("address")
+        if not shard_url:
+            _die(f"Shard sin URL: {shard}")
+        resp = requests.get(shard_url)
+        if not resp.ok:
+            _die(f"Error al descargar shard: {resp.status_code}")
+        encrypted_chunks.append(resp.content)
+
+    encrypted = b"".join(encrypted_chunks)
+    decrypted = _aes256ctr_decrypt(encrypted, file_key, iv)
+    dest_path.write_bytes(decrypted)
+    print(f"{prefix}✓  Guardado: {fname}")
+    return True
+
+
+def _download_dir(
+    client: InternxtClient,
+    folder_uuid: str,
+    local_dest: Path,
+    mnemonic: str,
+    bucket_id: str,
+    bridge_user: str,
+    user_id: str,
+    prefix: str = "",
+) -> None:
+    """Descarga recursivamente una carpeta de Internxt a local_dest."""
+    print(f"{prefix}📁 {local_dest.name}/")
+    folders, files = _list_folder(client, folder_uuid)
+
+    for file in files:
+        file_uuid = file.get("uuid") or file.get("id")
+        meta      = client.get(f"/files/{file_uuid}/meta")
+        fname     = meta.get("plainName") or meta.get("name") or file_uuid
+        _download_single_file(
+            client, meta, local_dest / fname,
+            mnemonic, bucket_id, bridge_user, user_id,
+            prefix=prefix + "   ",
+        )
+
+    for folder in folders:
+        sub_name = folder.get("plainName") or folder.get("name") or folder.get("uuid")
+        sub_dest = local_dest / sub_name
+        sub_dest.mkdir(exist_ok=True)
+        _download_dir(
+            client, folder.get("uuid") or folder.get("id"), sub_dest,
+            mnemonic, bucket_id, bridge_user, user_id,
+            prefix=prefix + "   ",
+        )
+
+
 # ── Comandos ──────────────────────────────────────────────────────────────────
 
 def cmd_ls(args):
@@ -715,15 +970,13 @@ def _content_hash(data: bytes) -> str:
 
 
 def cmd_upload(args):
-    """Subida nativa de ficheros con cifrado E2E (AES-256-CTR + clave derivada del mnemónico)."""
+    """Subida nativa de ficheros/carpetas con cifrado E2E (AES-256-CTR)."""
     creds  = _load_creds()
     client = InternxtClient(creds["token"], creds.get("new_token"))
 
     local_path = Path(args.local)
     if not local_path.exists():
-        _die(f"Fichero no encontrado: {local_path}")
-    if local_path.is_dir():
-        _die("El comando upload es para ficheros, no carpetas")
+        _die(f"Ruta no encontrada: {local_path}")
 
     mnemonic    = creds.get("mnemonic", "")
     bucket_id   = creds.get("bucket") or creds["user"].get("bucket")
@@ -742,90 +995,20 @@ def cmd_upload(args):
     else:
         folder_uuid = creds["root_folder_uuid"]
 
-    file_size = local_path.stat().st_size
-    file_name = local_path.name
-    file_ext  = local_path.suffix.lstrip(".")
-    plain_name = local_path.stem if file_ext else file_name
-
-    print(f"↑  {local_path.name}  ({_human_size(file_size)})")
-
-    # 1. Leer y cifrar el fichero
-    print("   Cifrando…")
-    index_bytes  = os.urandom(32)                          # 32 bytes aleatorios
-    iv           = index_bytes[:16]                        # primeros 16 = IV
-    file_key     = _derive_file_key(mnemonic, bucket_id, index_bytes)
-    raw_data     = local_path.read_bytes()
-    encrypted    = _aes256ctr_encrypt(raw_data, file_key, iv)
-    file_hash    = _content_hash(encrypted)
-    index_hex    = index_bytes.hex()                       # 64-char hex
-
-    # 2. Iniciar subida en el Network API
-    net_headers = _network_headers(bridge_user, user_id)
-    r = requests.post(
-        f"{NETWORK_API}/v2/buckets/{bucket_id}/files/start?multiparts=1",
-        json={"uploads": [{"index": 0, "size": file_size}]},
-        headers=net_headers,
-    )
-    if not r.ok:
-        _die(f"Error al iniciar subida: {r.status_code} {r.text}")
-    upload_info = r.json()["uploads"][0]
-    upload_url  = upload_info["url"]
-    shard_uuid  = upload_info["uuid"]
-
-    # 3. Subir el contenido cifrado al URL de almacenamiento
-    print("   Subiendo…")
-    put_r = requests.put(
-        upload_url,
-        data=encrypted,
-        headers={"Content-Type": "application/octet-stream",
-                 "Content-Length": str(len(encrypted))},
-    )
-    if not put_r.ok:
-        _die(f"Error al subir datos: {put_r.status_code} {put_r.text}")
-
-    # 4. Finalizar subida en el Network API → obtiene fileId
-    r2 = requests.post(
-        f"{NETWORK_API}/v2/buckets/{bucket_id}/files/finish",
-        json={"index": index_hex, "shards": [{"hash": file_hash, "uuid": shard_uuid}]},
-        headers=net_headers,
-    )
-    if not r2.ok:
-        _die(f"Error al finalizar subida: {r2.status_code} {r2.text}")
-    file_id = r2.json().get("id") or r2.json().get("fileId")
-
-    # 5. Registrar el fichero en el Drive API (o reemplazar si ya existe → crea versión)
-    import datetime
-    now = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
-
-    existing = _find_file_in_folder(client, folder_uuid, file_name)
-    if existing:
-        existing_uuid = existing.get("uuid") or existing.get("id")
-        replace_payload = {
-            "fileId":           file_id,
-            "size":             file_size,
-            "modificationTime": now,
-        }
-        result = client.put(f"/files/{existing_uuid}", json=replace_payload)
-        print(f"✓  Actualizado (versión creada): {file_name}  (id: {existing_uuid})")
+    if local_path.is_dir():
+        _upload_dir(
+            client, local_path, folder_uuid, local_path.name,
+            mnemonic, bucket_id, bridge_user, user_id,
+        )
     else:
-        drive_payload = {
-            "name":             file_name,
-            "plainName":        file_name,
-            "bucket":           bucket_id,
-            "fileId":           file_id,
-            "encryptVersion":   "Aes03",
-            "folderUuid":       folder_uuid,
-            "size":             file_size,
-            "type":             file_ext or "",
-            "modificationTime": now,
-            "date":             now,
-        }
-        result = client.post("/files", json=drive_payload)
-        print(f"✓  Subido: {file_name}  (id: {result.get('uuid') or file_id})")
+        _upload_single_file(
+            client, local_path, folder_uuid,
+            mnemonic, bucket_id, bridge_user, user_id,
+        )
 
 
 def cmd_download(args):
-    """Descarga nativa de ficheros con descifrado E2E (AES-256-CTR)."""
+    """Descarga nativa de ficheros/carpetas con descifrado E2E (AES-256-CTR)."""
     creds  = _load_creds()
     client = InternxtClient(creds["token"], creds.get("new_token"))
 
@@ -839,62 +1022,24 @@ def cmd_download(args):
 
     remote = args.remote.strip("/")
     uuid, fname, is_folder = _resolve_path(client, creds, remote)
+
     if is_folder:
-        _die("El comando download es para ficheros, no carpetas")
-
-    # Obtener metadata del fichero (fileId, size, bucket)
-    meta    = client.get(f"/files/{uuid}/meta")
-    file_id = meta.get("fileId") or meta.get("file_id")
-    size    = int(meta.get("size") or 0)
-    fbucket = meta.get("bucket") or bucket_id
-
-    print(f"↓  {fname or remote.split('/')[-1]}  ({_human_size(size)})")
-
-    # Obtener links de descarga del Network API
-    net_headers = _network_headers(bridge_user, user_id)
-    r = requests.get(
-        f"{NETWORK_API}/buckets/{fbucket}/files/{file_id}/info",
-        headers={**net_headers, "x-api-version": "2"},
-    )
-    if not r.ok:
-        _die(f"Error al obtener info de descarga: {r.status_code} {r.text}")
-    info       = r.json()
-    index_hex  = info.get("index")
-    shards     = info.get("shards", [])
-
-    if not index_hex or not shards:
-        _die(f"Respuesta inesperada del network: {info}")
-
-    # Derivar clave
-    index_bytes = bytes.fromhex(index_hex)
-    iv          = index_bytes[:16]
-    file_key    = _derive_file_key(mnemonic, fbucket, index_bytes)
-
-    # Descargar shards (ordenados por index)
-    shards_sorted = sorted(shards, key=lambda s: s.get("index", 0))
-    print("   Descargando…")
-    encrypted_chunks = []
-    for shard in shards_sorted:
-        shard_url = shard.get("url") or shard.get("farmer", {}).get("address")
-        if not shard_url:
-            _die(f"Shard sin URL: {shard}")
-        resp = requests.get(shard_url)
-        if not resp.ok:
-            _die(f"Error al descargar shard: {resp.status_code}")
-        encrypted_chunks.append(resp.content)
-
-    encrypted = b"".join(encrypted_chunks)
-
-    # Descifrar
-    print("   Descifrando…")
-    decrypted = _aes256ctr_decrypt(encrypted, file_key, iv)
-
-    # Guardar
-    dest_path = Path(args.dest)
-    if dest_path.is_dir():
-        dest_path = dest_path / (fname or remote.split("/")[-1])
-    dest_path.write_bytes(decrypted)
-    print(f"✓  Guardado en: {dest_path}")
+        folder_name = fname or remote.split("/")[-1] or "root"
+        dest_dir    = Path(args.dest) / folder_name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        _download_dir(
+            client, uuid, dest_dir,
+            mnemonic, bucket_id, bridge_user, user_id,
+        )
+    else:
+        meta      = client.get(f"/files/{uuid}/meta")
+        dest_path = Path(args.dest)
+        if dest_path.is_dir():
+            dest_path = dest_path / fname
+        _download_single_file(
+            client, meta, dest_path,
+            mnemonic, bucket_id, bridge_user, user_id,
+        )
 
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
@@ -934,7 +1079,9 @@ Ejemplos:
   python internxt.py trash clear
   python internxt.py info
   python internxt.py upload ./foto.jpg /Imágenes/
+  python internxt.py upload ./mi-carpeta/ /Backups/
   python internxt.py download /Documentos/doc.pdf ./local/
+  python internxt.py download /Backups/mi-carpeta ./local/
   python internxt.py versions /Documentos/informe.pdf
   python internxt.py versions /Documentos/informe.pdf list
   python internxt.py versions /Documentos/informe.pdf restore <versionId>
@@ -995,13 +1142,13 @@ Ejemplos:
     vd_p.add_argument("version_id", help="ID de la versión")
 
     # upload
-    up_p = sub.add_parser("upload", help="Subir fichero local a Internxt")
-    up_p.add_argument("local",  help="Ruta local del fichero")
+    up_p = sub.add_parser("upload", help="Subir fichero o carpeta a Internxt (recursivo)")
+    up_p.add_argument("local",  help="Ruta local del fichero o carpeta")
     up_p.add_argument("remote", nargs="?", default="/", help="Carpeta destino en Internxt (por defecto: raíz)")
 
     # download
-    dl_p = sub.add_parser("download", help="Descargar fichero de Internxt")
-    dl_p.add_argument("remote", help="Ruta del fichero en Internxt")
+    dl_p = sub.add_parser("download", help="Descargar fichero o carpeta de Internxt (recursivo)")
+    dl_p.add_argument("remote", help="Ruta del fichero o carpeta en Internxt")
     dl_p.add_argument("dest",   nargs="?", default=".", help="Carpeta local destino")
 
     args = p.parse_args()

@@ -13,8 +13,8 @@ endpoint, giving free users full access to their drive via the command line.
 - Move and rename files and folders
 - Delete (to trash or permanently)
 - Manage trash (list, clear)
-- Upload files with native E2E encryption (AES-256-CTR)
-- Download files with native E2E decryption
+- Upload files and folders with native E2E encryption (AES-256-CTR), recursively
+- Download files and folders with native E2E decryption, recursively
 - File versioning support — list, restore, and delete previous versions (Premium/Ultimate plans)
 - Smart upload — re-uploading an existing file replaces it (no duplicates) and triggers versioning if available
 - Two-factor authentication (2FA) support
@@ -103,8 +103,14 @@ python3 internxt.py upload ./photo.jpg /Photos/
 # Re-upload the same file (replaces it instead of creating a duplicate)
 python3 internxt.py upload ./photo.jpg /Photos/
 
+# Upload an entire folder (recursive)
+python3 internxt.py upload ./my-folder /Backups/
+
 # Download a file
 python3 internxt.py download /Documents/contract.pdf ./local/
+
+# Download an entire folder (recursive)
+python3 internxt.py download /Backups/my-folder ./local/
 
 # File versioning (Premium/Ultimate plans only)
 python3 internxt.py versions /Documents/report.pdf          # list versions
@@ -140,7 +146,6 @@ do not share it.
 
 ## Limitations
 
-- Upload/download works for single files only (no recursive folder upload).
 - Trash restore is not fully tested.
 - No progress bar for large file uploads.
 
