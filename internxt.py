@@ -376,6 +376,22 @@ def _resolve_path(client: InternxtClient, creds: dict, path: str) -> tuple[str, 
     return uuid, name, (kind == "folder")
 
 
+def _find_file_in_folder(client: InternxtClient, folder_uuid: str, filename: str) -> dict | None:
+    """Devuelve el dict del fichero si existe en la carpeta con ese nombre, o None."""
+    offset = 0
+    while True:
+        data  = client.get(f"/folders/content/{folder_uuid}/files",
+                           params={"limit": 50, "offset": offset})
+        items = data if isinstance(data, list) else data.get("files", [])
+        for f in items:
+            fname = f.get("plainName") or f.get("name") or ""
+            if fname == filename:
+                return f
+        if not items or len(items) < 50:
+            return None
+        offset += 50
+
+
 def _list_folder(client: InternxtClient, uuid: str) -> tuple[list, list]:
     """Devuelve (carpetas, ficheros) de una carpeta por UUID."""
     folders, files = [], []
@@ -596,6 +612,52 @@ def cmd_info(args):
     print(f"📊  Ocupado:   {pct:.1f}%")
 
 
+def cmd_versions(args):
+    """Gestiona versiones de un fichero (listar, restaurar, eliminar)."""
+    client, creds = _client()
+    sub  = getattr(args, "versions_cmd", None) or "list"
+
+    # Comprobar si el plan tiene versioning habilitado
+    limits = client.get("/files/limits")
+    versioning = limits.get("versioning", {})
+    if not versioning.get("enabled"):
+        _die(
+            "El versionado de ficheros no está disponible en tu plan actual.\n"
+            "  Actívalo en: https://drive.internxt.com/settings/account"
+        )
+
+    path = args.path.strip("/")
+    uuid, _, is_folder = _resolve_path(client, creds, path)
+    if is_folder:
+        _die(f"'{args.path}' es una carpeta, no un fichero")
+
+    if sub == "list":
+        versions = client.get(f"/files/{uuid}/versions")
+        if not versions:
+            print("Este fichero no tiene versiones previas.")
+            return
+        print(f"📋  Versiones de /{path}:")
+        for v in versions:
+            vid      = v.get("id")
+            size     = _human_size(int(v.get("size") or 0))
+            created  = (v.get("createdAt") or "")[:19].replace("T", " ")
+            expires  = (v.get("expiresAt") or "")[:10]
+            print(f"  {vid}  {size:>8}  {created}  (expira: {expires})")
+        print(f"\n  {len(versions)} versión(es)")
+
+    elif sub == "restore":
+        vid = args.version_id
+        result = client.post(f"/files/{uuid}/versions/{vid}/restore")
+        print(f"✓ Versión {vid} restaurada")
+        if getattr(args, "verbose", False):
+            print(json.dumps(result, indent=2))
+
+    elif sub == "delete":
+        vid = args.version_id
+        client.delete(f"/files/{uuid}/versions/{vid}")
+        print(f"✓ Versión {vid} eliminada")
+
+
 def _network_headers(bridge_user: str, user_id: str) -> dict:
     """
     Basic Auth para el Network API.
@@ -731,23 +793,35 @@ def cmd_upload(args):
         _die(f"Error al finalizar subida: {r2.status_code} {r2.text}")
     file_id = r2.json().get("id") or r2.json().get("fileId")
 
-    # 5. Registrar el fichero en el Drive API
+    # 5. Registrar el fichero en el Drive API (o reemplazar si ya existe → crea versión)
     import datetime
     now = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
-    drive_payload = {
-        "name":             file_name,
-        "plainName":        file_name,
-        "bucket":           bucket_id,
-        "fileId":           file_id,
-        "encryptVersion":   "Aes03",
-        "folderUuid":       folder_uuid,
-        "size":             file_size,
-        "type":             file_ext or "",
-        "modificationTime": now,
-        "date":             now,
-    }
-    result = client.post("/files", json=drive_payload)
-    print(f"✓  Subido: {file_name}  (id: {result.get('uuid') or file_id})")
+
+    existing = _find_file_in_folder(client, folder_uuid, file_name)
+    if existing:
+        existing_uuid = existing.get("uuid") or existing.get("id")
+        replace_payload = {
+            "fileId":           file_id,
+            "size":             file_size,
+            "modificationTime": now,
+        }
+        result = client.put(f"/files/{existing_uuid}", json=replace_payload)
+        print(f"✓  Actualizado (versión creada): {file_name}  (id: {existing_uuid})")
+    else:
+        drive_payload = {
+            "name":             file_name,
+            "plainName":        file_name,
+            "bucket":           bucket_id,
+            "fileId":           file_id,
+            "encryptVersion":   "Aes03",
+            "folderUuid":       folder_uuid,
+            "size":             file_size,
+            "type":             file_ext or "",
+            "modificationTime": now,
+            "date":             now,
+        }
+        result = client.post("/files", json=drive_payload)
+        print(f"✓  Subido: {file_name}  (id: {result.get('uuid') or file_id})")
 
 
 def cmd_download(args):
@@ -861,6 +935,10 @@ Ejemplos:
   python internxt.py info
   python internxt.py upload ./foto.jpg /Imágenes/
   python internxt.py download /Documentos/doc.pdf ./local/
+  python internxt.py versions /Documentos/informe.pdf
+  python internxt.py versions /Documentos/informe.pdf list
+  python internxt.py versions /Documentos/informe.pdf restore <versionId>
+  python internxt.py versions /Documentos/informe.pdf delete <versionId>
         """,
     )
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -905,6 +983,17 @@ Ejemplos:
     # info
     sub.add_parser("info", help="Ver uso de almacenamiento")
 
+    # versions
+    vr_p  = sub.add_parser("versions", help="Gestionar versiones de un fichero (pdf, docx, xlsx, csv)")
+    vr_p.add_argument("path", help="Ruta del fichero en Internxt")
+    vr_sub = vr_p.add_subparsers(dest="versions_cmd", required=False)
+    vr_sub.add_parser("list", help="Listar versiones (por defecto)")
+    vs_p = vr_sub.add_parser("restore", help="Restaurar una versión")
+    vs_p.add_argument("version_id", help="ID de la versión")
+    vs_p.add_argument("-v", "--verbose", action="store_true")
+    vd_p = vr_sub.add_parser("delete", help="Eliminar una versión")
+    vd_p.add_argument("version_id", help="ID de la versión")
+
     # upload
     up_p = sub.add_parser("upload", help="Subir fichero local a Internxt")
     up_p.add_argument("local",  help="Ruta local del fichero")
@@ -928,6 +1017,7 @@ Ejemplos:
         "info":     cmd_info,
         "upload":   cmd_upload,
         "download": cmd_download,
+        "versions": cmd_versions,
     }
     dispatch[args.cmd](args)
 
