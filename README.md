@@ -15,6 +15,8 @@ endpoint, giving free users full access to their drive via the command line.
 - Manage trash (list, clear)
 - Upload files with native E2E encryption (AES-256-CTR)
 - Download files with native E2E decryption
+- File versioning support — list, restore, and delete previous versions (Premium/Ultimate plans)
+- Smart upload — re-uploading an existing file replaces it (no duplicates) and triggers versioning if available
 - Two-factor authentication (2FA) support
 - No Node.js required
 
@@ -98,8 +100,16 @@ python3 internxt.py info
 # Upload a file
 python3 internxt.py upload ./photo.jpg /Photos/
 
+# Re-upload the same file (replaces it instead of creating a duplicate)
+python3 internxt.py upload ./photo.jpg /Photos/
+
 # Download a file
 python3 internxt.py download /Documents/contract.pdf ./local/
+
+# File versioning (Premium/Ultimate plans only)
+python3 internxt.py versions /Documents/report.pdf          # list versions
+python3 internxt.py versions /Documents/report.pdf restore <versionId>
+python3 internxt.py versions /Documents/report.pdf delete <versionId>
 ```
 
 ## How it works
